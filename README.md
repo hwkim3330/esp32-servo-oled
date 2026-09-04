@@ -56,18 +56,34 @@ non-blocking (no `delay()` in `loop()`), so serial stays responsive during motio
 
 ## If the servo does not move
 
-`p` shows the GPIO being driven on screen while it twitches the horn, so a
-signal wire in the wrong hole is found by watching for the twitch and reading the
-number. `u<gpio>` then pins it there.
+Split the board from the servo before guessing at either.
 
-Before suspecting the firmware, check the connector seating. On a TowerPro SG90 the
-lead order is **brown = GND, red = +5V, orange = signal**; a connector one hole off
-puts GND on the signal GPIO, which looks exactly like a dead servo — it still holds
-position stiffly (so it feels powered) but ignores every angle command, and the
-return current is flowing through a GPIO that is not rated for it.
+**`m` settles the board half.** It reads the servo pin back through the GPIO matrix
+— no jumper, no scope — and prints pulse width, period and rate. Healthy output on
+this build looks like:
 
-A servo with power but no pulses goes limp instead. So: limp = no signal,
-stiff but deaf = signal pin is not where you think it is.
+```
+measure GPIO23 (servo on GPIO23): 25 pulses / 500 ms, high=1445 us, period=20000 us (50.0 Hz), commanded=1450 us
+```
+
+Pulse width tracking the commanded angle at 50.0 Hz means the firmware, the pin and
+the timer are all fine, and the fault is downstream. `m19` measures a different pin
+instead, for when you want a jumper-verified second opinion.
+
+**`p` settles the wrong-hole case** — it walks the signal across candidate GPIOs,
+3 s each, twitching the horn 50°↔130° while the pin number fills the screen. Watch
+for the twitch, then `u<gpio>` to pin it there. Lead colours on a TowerPro SG90 are
+brown = GND, red = +5V, signal = orange **or yellow** depending on the batch.
+
+**What does not work as a test:** turning the horn by hand. A micro servo's gear
+train is stiff to backdrive with the power off too, so "it resists, therefore it is
+powered" is not a valid inference — it cost an hour here.
+
+A better free signal: watch for a brownout. A servo that is genuinely trying to move
+draws hundreds of mA on each start, which sags a USB-fed 5V rail enough to reset the
+ESP32 or blink the panel. Full-range commands that produce no disturbance at all
+mean the servo is drawing nothing — no power reaching it, or a dead servo. On this
+desk it was a dead servo: correct wiring, verified pulses, no current draw, no motion.
 
 ## Build
 
