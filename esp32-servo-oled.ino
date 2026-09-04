@@ -40,7 +40,13 @@ U8G2 *disp = nullptr;
 
 Servo servo;
 
-enum Mode { MODE_SWEEP, MODE_MANUAL };
+// PINHUNT drives each candidate pin in turn so a mis-plugged signal wire can be
+// found by watching which pin number is on screen when the horn twitches.
+static const uint8_t HUNT_PINS[] = {23, 19, 18, 5, 17, 16, 4, 13, 14, 27, 26, 25, 33, 32, 2, 15};
+static const uint8_t HUNT_N = sizeof(HUNT_PINS);
+static const uint32_t HUNT_MS = 3000;   // time spent on each candidate pin
+
+enum Mode { MODE_SWEEP, MODE_MANUAL, MODE_PINHUNT };
 Mode  mode     = MODE_SWEEP;
 float curAngle = 90.0;   // what the servo is holding
 float tgtAngle = 90.0;   // where manual mode is heading
@@ -50,6 +56,10 @@ bool  oledSwapped = false;
 
 uint32_t tServo = 0, tOled = 0, tPhase = 0, tProbe = 0;
 bool sweepUp = true, dwelling = false;
+
+uint8_t  huntIdx  = 0;        // candidate pin currently being driven
+uint8_t  servoPin = PIN_SERVO;
+uint32_t tHunt    = 0;
 
 // servo 0 deg -> right side of the dial, 180 deg -> left side
 static inline float dialRad(float deg) { return PI * (1.0f - deg / 180.0f); }
@@ -112,13 +122,79 @@ bool findPanel(bool verbose) {
   return true;
 }
 
+// ---- loopback pulse check ------------------------------------------------
+// Jumper the servo signal pin to MON_PIN and the board measures its own output,
+// which settles whether the pin is really producing servo pulses.
+static const uint8_t MON_PIN = 19;
+volatile uint32_t monRise = 0, monHigh = 0, monPeriod = 0, monCount = 0;
+
+volatile uint8_t monPin = 0;
+
+void IRAM_ATTR monIsrPin() {
+  uint32_t t = micros();
+  if (digitalRead(monPin)) {
+    if (monRise) monPeriod = t - monRise;
+    monRise = t;
+    monCount++;
+  } else if (monRise) {
+    monHigh = t - monRise;
+  }
+}
+
+// pin == servoPin reads the driven pin back with no jumper at all; any other pin
+// expects a jumper from the servo signal pin to it.
+void measurePulse(uint8_t pin) {
+  monPin = pin;
+  if (pin != servoPin) pinMode(pin, INPUT_PULLDOWN);
+  monRise = monHigh = monPeriod = monCount = 0;
+  attachInterrupt(digitalPinToInterrupt(pin), monIsrPin, CHANGE);
+  uint32_t t0 = millis();
+  while (millis() - t0 < 500) delay(10);
+  detachInterrupt(digitalPinToInterrupt(pin));
+
+  Serial.printf("measure GPIO%u (servo on GPIO%u): %u pulses / 500 ms", pin, servoPin, monCount);
+  if (monCount)
+    Serial.printf(", high=%u us, period=%u us (%.1f Hz), commanded=%d us\n",
+                  monHigh, monPeriod, monPeriod ? 1000000.0 / monPeriod : 0.0, curUs);
+  else if (pin == servoPin)
+    Serial.printf(" - readback unavailable on a driven pin; jumper GPIO%u to GPIO%u and run m%u\n",
+                  servoPin, MON_PIN, MON_PIN);
+  else
+    Serial.printf(" - nothing: no jumper GPIO%u->GPIO%u, or the pin is not driving\n", servoPin, pin);
+}
+
+const char *modeName() {
+  return mode == MODE_SWEEP ? "SWEEP" : (mode == MODE_MANUAL ? "MANUAL" : "PINHUNT");
+}
+
+// full-screen readout of the pin being driven right now
+void drawHunt() {
+  char buf[24];
+  disp->clearBuffer();
+  disp->setFont(u8g2_font_6x12_tr);
+  disp->drawStr(0, 11, "PINHUNT");
+  snprintf(buf, sizeof(buf), "%u/%u", huntIdx + 1, HUNT_N);
+  disp->drawStr(128 - disp->getStrWidth(buf), 11, buf);
+  disp->drawHLine(0, 15, 128);
+
+  disp->setFont(u8g2_font_logisoso28_tn);
+  snprintf(buf, sizeof(buf), "%u", HUNT_PINS[huntIdx]);
+  disp->drawStr((128 - disp->getStrWidth(buf)) / 2, 50, buf);
+
+  disp->setFont(u8g2_font_5x7_tr);
+  disp->drawStr(0, 26, "GPIO");
+  disp->drawStr(0, 63, "moving? this is the pin");
+  disp->sendBuffer();
+}
+
 void draw() {
   char buf[16];
+  if (mode == MODE_PINHUNT) { drawHunt(); return; }
   disp->clearBuffer();
 
   // ---- yellow status band -------------------------------------------------
   disp->setFont(u8g2_font_6x12_tr);
-  disp->drawStr(0, 11, mode == MODE_SWEEP ? "SWEEP" : "MANUAL");
+  disp->drawStr(0, 11, modeName());
 
   disp->setFont(u8g2_font_helvB12_tr);
   snprintf(buf, sizeof(buf), "%d", (int)lroundf(curAngle));
@@ -160,9 +236,24 @@ void applyServo(float ang) {
   servo.writeMicroseconds(curUs);
 }
 
+// move the servo signal to another pin at runtime
+void useServoPin(uint8_t pin) {
+  servoPin = pin;
+  if (servo.attached()) servo.detach();
+  servo.setPeriodHertz(50);
+  servo.attach(pin, US_MIN, US_MAX);
+  applyServo(curAngle);
+}
+
 void setMode(Mode m) {
   mode   = m;
   tPhase = millis();
+  if (m == MODE_PINHUNT) {
+    huntIdx = 0;
+    tHunt   = millis();
+    useServoPin(HUNT_PINS[0]);
+    Serial.printf("pinhunt: driving GPIO%u\n", HUNT_PINS[0]);
+  }
   if (m == MODE_SWEEP) {  // resume the sweep from wherever the horn currently sits
     sweepUp  = curAngle < (ANG_MIN + ANG_MAX) / 2.0f;
     dwelling = false;
@@ -184,8 +275,18 @@ void handleSerial() {
     if (buf[0] == 's' || buf[0] == 'S')      { setMode(MODE_SWEEP); Serial.println("mode=SWEEP"); }
     else if (buf[0] == 'c' || buf[0] == 'C') { tgtAngle = 90; setMode(MODE_MANUAL); Serial.println("center"); }
     else if (buf[0] == 'i' || buf[0] == 'I') { Serial.println("i2c scan:"); if (!findPanel(true)) Serial.println("  bus silent"); }
-    else if (buf[0] == '?')                  { Serial.printf("mode=%s angle=%.1f us=%d oled=0x%02X%s\n",
-                                                 mode == MODE_SWEEP ? "SWEEP" : "MANUAL", curAngle, curUs,
+    else if (buf[0] == 'p' || buf[0] == 'P') { setMode(MODE_PINHUNT); }
+    else if (buf[0] == 'm' || buf[0] == 'M') { // m -> read the servo pin back, m19 -> read GPIO19
+      long p = strtol(buf + 1, nullptr, 10);
+      measurePulse((buf[1] && p >= 0 && p <= 39) ? (uint8_t)p : servoPin);
+    }
+    else if (buf[0] == 'u' || buf[0] == 'U') { // u23 -> keep driving GPIO23
+      long p = strtol(buf + 1, nullptr, 10);
+      if (p >= 0 && p <= 39) { useServoPin((uint8_t)p); setMode(MODE_SWEEP); Serial.printf("servo pin=GPIO%ld\n", p); }
+      else Serial.println("usage: u<gpio>");
+    }
+    else if (buf[0] == '?')                  { Serial.printf("mode=%s angle=%.1f us=%d pin=GPIO%u oled=0x%02X%s\n",
+                                                 modeName(), curAngle, curUs, servoPin,
                                                  oledAddr, oledSwapped ? " (swapped)" : ""); }
     else {
       char *end;
@@ -195,7 +296,7 @@ void handleSerial() {
         setMode(MODE_MANUAL);
         Serial.printf("target=%.0f\n", tgtAngle);
       } else {
-        Serial.println("cmd: <0-180> | s(weep) | c(enter) | i(2c scan) | ?");
+        Serial.println("cmd: <0-180> | s | c | i | p(inhunt) | u<gpio> | m[gpio] measure | ?");
       }
     }
   }
@@ -214,7 +315,7 @@ void setup() {
   applyServo(curAngle);
 
   delay(1500);
-  Serial.println("cmd: <0-180> | s(weep) | c(enter) | i(2c scan) | ?");
+  Serial.println("cmd: <0-180> | s | c | i | p(inhunt) | u<gpio> | m[gpio] measure | ?");
   setMode(MODE_SWEEP);
 }
 
@@ -243,6 +344,15 @@ void loop() {
         curAngle = sweepUp ? ANG_MIN + (ANG_MAX - ANG_MIN) * e
                            : ANG_MAX - (ANG_MAX - ANG_MIN) * e;
       }
+    } else if (mode == MODE_PINHUNT) {
+      if (now - tHunt >= HUNT_MS) {               // next candidate pin
+        tHunt   = now;
+        huntIdx = (huntIdx + 1) % HUNT_N;
+        useServoPin(HUNT_PINS[huntIdx]);
+        Serial.printf("pinhunt: driving GPIO%u\n", HUNT_PINS[huntIdx]);
+      }
+      // a big, obvious 1 Hz twitch so it is unmistakable which pin is live
+      curAngle = ((now - tHunt) / 500) % 2 ? 130.0f : 50.0f;
     } else {
       float step = SLEW_DPS * SERVO_DT / 1000.0f;  // rate limited so it never slams
       if (fabsf(tgtAngle - curAngle) <= step) curAngle = tgtAngle;

@@ -50,7 +50,24 @@ non-blocking (no `delay()` in `loop()`), so serial stays responsive during motio
 | `s` | resume the sweep from the current position |
 | `c` | centre at 90° |
 | `i` | rescan the I2C bus and report every address found |
-| `?` | print mode, angle, pulse width, panel address |
+| `p` | pin hunt: drive each candidate GPIO in turn, 3 s each, twitching 50°↔130° |
+| `u<gpio>` | move the servo signal to that GPIO and resume sweeping |
+| `?` | print mode, angle, pulse width, servo pin, panel address |
+
+## If the servo does not move
+
+`p` shows the GPIO being driven on screen while it twitches the horn, so a
+signal wire in the wrong hole is found by watching for the twitch and reading the
+number. `u<gpio>` then pins it there.
+
+Before suspecting the firmware, check the connector seating. On a TowerPro SG90 the
+lead order is **brown = GND, red = +5V, orange = signal**; a connector one hole off
+puts GND on the signal GPIO, which looks exactly like a dead servo — it still holds
+position stiffly (so it feels powered) but ignores every angle command, and the
+return current is flowing through a GPIO that is not rated for it.
+
+A servo with power but no pulses goes limp instead. So: limp = no signal,
+stiff but deaf = signal pin is not where you think it is.
 
 ## Build
 
