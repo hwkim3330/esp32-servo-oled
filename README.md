@@ -31,6 +31,9 @@ Do not feed the servo from the 3.3V rail: its stall current browns out the ESP32
 
 ## Motion
 
+It boots straight into `SWEEP` and runs on its own — no button, no host, nothing
+to press. Serial is only there if you want to take over.
+
 * `SWEEP` — 0° → 180° → 0°, 2.5 s each way with a 400 ms dwell at both ends. The
   travel is cosine-eased, so the horn accelerates and decelerates instead of
   slamming into the end stops.
